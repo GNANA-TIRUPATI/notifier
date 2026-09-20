@@ -45,11 +45,12 @@ def send_email(cells_data, error=None):
   sender_password = os.environ[
       "SENDER_APP_PASSWORD"
   ]  # Gmail App Password (16 chars)
-  recipient_email = os.environ["RECIPIENT_EMAIL"]
+  recipient_raw = os.environ["RECIPIENT_EMAIL"]
+  recipient_list = [e.strip() for e in recipient_raw.split(",") if e.strip()]
 
   msg = MIMEMultipart("alternative")
   msg["From"] = sender_email
-  msg["To"] = recipient_email
+  msg["To"] = ", ".join(recipient_list)
 
   current_time = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
@@ -86,7 +87,7 @@ def send_email(cells_data, error=None):
   with smtplib.SMTP("smtp.gmail.com", 587) as server:
     server.starttls()
     server.login(sender_email, sender_password)
-    server.sendmail(sender_email, recipient_email, msg.as_string())
+    server.sendmail(sender_email, recipient_list, msg.as_string())
 
 
 if __name__ == "__main__":
