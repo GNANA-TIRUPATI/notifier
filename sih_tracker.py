@@ -34,37 +34,28 @@ def fetch_submission_count():
     page = context.new_page()
 
     try:
-      page.goto(PORTAL_URL, timeout=90000, wait_until="networkidle")
+      page.goto(PORTAL_URL, timeout=60000, wait_until="domcontentloaded")
 
-      # Wait for the DataTable to render rows (use 'attached' not 'visible'
-      # because rows may be below the viewport fold in headless CI)
+      # Wait for the DataTable to render rows
       page.wait_for_selector(
-          "#dataTablePS tbody tr td", timeout=90000, state="attached"
+          "#dataTablePS tbody tr td", timeout=45000, state="attached"
       )
 
-      # Wait for DataTables JS to fully initialize
-      page.wait_for_function(
-          """() => {
-            return typeof $ !== 'undefined'
-              && $.fn && $.fn.dataTable
-              && $('#dataTablePS').DataTable().rows().count() > 0;
-          }""",
-          timeout=30000,
-      )
-      # Extra settle time for CI environments
-      page.wait_for_timeout(2000)
-
-      # Use the DataTables search input to filter to our PS ID
+      # Filter using the search box if present
       search_input = page.locator('input[type="search"]').first
-      if search_input.is_visible():
-        search_input.click()
+      try:
+        search_input.wait_for(state="attached", timeout=10000)
         search_input.fill(PS_ID)
-        # Allow DataTables debounce to filter rows
-        page.wait_for_timeout(3500)
+        page.wait_for_timeout(1500)
+      except Exception:
+        pass
 
       # Locate the filtered row in the main DataTable
       target_row = page.locator(f"#dataTablePS tbody tr:has-text('{PS_ID}')")
-
+      try:
+        target_row.first.wait_for(state="attached", timeout=15000)
+      except Exception:
+        pass
       if target_row.count() == 0:
         # Capture diagnostic info on failure
         page_title = page.title()
