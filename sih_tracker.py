@@ -36,10 +36,23 @@ def fetch_submission_count():
     try:
       page.goto(PORTAL_URL, timeout=90000, wait_until="networkidle")
 
-      # Wait for the DataTable to fully render rows
+      # Wait for the DataTable to render rows (use 'attached' not 'visible'
+      # because rows may be below the viewport fold in headless CI)
       page.wait_for_selector(
-          "#dataTablePS tbody tr td", timeout=45000, state="visible"
+          "#dataTablePS tbody tr td", timeout=90000, state="attached"
       )
+
+      # Wait for DataTables JS to fully initialize
+      page.wait_for_function(
+          """() => {
+            return typeof $ !== 'undefined'
+              && $.fn && $.fn.dataTable
+              && $('#dataTablePS').DataTable().rows().count() > 0;
+          }""",
+          timeout=30000,
+      )
+      # Extra settle time for CI environments
+      page.wait_for_timeout(2000)
 
       # Use the DataTables search input to filter to our PS ID
       search_input = page.locator('input[type="search"]').first
@@ -47,7 +60,7 @@ def fetch_submission_count():
         search_input.click()
         search_input.fill(PS_ID)
         # Allow DataTables debounce to filter rows
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(3500)
 
       # Locate the filtered row in the main DataTable
       target_row = page.locator(f"#dataTablePS tbody tr:has-text('{PS_ID}')")
