@@ -1,15 +1,28 @@
+import os
+import smtplib
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-import os
-import smtplib
 from playwright.sync_api import sync_playwright  # pyrefly: ignore
 
-SEARCH_QUERY = "AI-Based Intelligent Video Analytics Platform for Border Surveillance using existing CCTV Infrastructure"
+PS_ID = "SIH26187"
 PORTAL_URL = "https://sih.gov.in/sih2026PS"
+
+# Column headers matching the visible DataTable columns (0-indexed)
+COLUMNS = [
+    "S.No.",
+    "Organization",
+    "Problem Statement Title",
+    "Category",
+    "PS Number",
+    "Submitted Idea(s) Count",
+    "Theme",
+    "Deadline for Idea Submission",
+]
 
 
 def fetch_submission_count():
+  """Scrape the SIH portal DataTable for the target problem statement row."""
   with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
     context = browser.new_context(
@@ -23,106 +36,132 @@ def fetch_submission_count():
     try:
       page.goto(PORTAL_URL, timeout=90000, wait_until="networkidle")
 
-      # Wait for DataTable to load
+      # Wait for the DataTable to fully render rows
       page.wait_for_selector(
-          "table tbody tr", timeout=45000, state="attached"
+          "#dataTablePS tbody tr td", timeout=45000, state="visible"
       )
 
-      # Locate the search filter input
-      search_input = page.locator(
-          'input[type="search"], #problemStatementTable_filter input,'
-          " .dataTables_filter input"
-      ).first
-
+      # Use the DataTables search input to filter to our PS ID
+      search_input = page.locator('input[type="search"]').first
       if search_input.is_visible():
         search_input.click()
-        search_input.fill(SEARCH_QUERY)
-        # Allow DataTables time to debounce and filter rows
-        page.wait_for_timeout(3500)
+        search_input.fill(PS_ID)
+        # Allow DataTables debounce to filter rows
+        page.wait_for_timeout(3000)
 
-      # Match the filtered row containing the title
-      target_row = page.locator(
-          "table tbody tr",
-          has_text=(
-              "AI-Based Intelligent Video Analytics Platform for Border"
-              " Surveillance"
-          ),
-      )
+      # Locate the filtered row in the main DataTable
+      target_row = page.locator(f"#dataTablePS tbody tr:has-text('{PS_ID}')")
 
       if target_row.count() == 0:
+        # Capture diagnostic info on failure
+        page_title = page.title()
+        page.screenshot(path="debug_failure.png")
+        all_text = page.locator("#dataTablePS").inner_text()[:500]
         browser.close()
-        return None, f"No row found matching title after search filter."
+        return None, (
+            f"PS ID '{PS_ID}' not found after search. "
+            f"Page title: '{page_title}'. "
+            f"Table preview: {all_text}"
+        )
 
-      cells = target_row.first.locator("td").all_text_contents()
+      # Extract only the direct visible <td> cells from the first matching row
+      # The SIH table embeds hidden modal content inside <td> elements, so we
+      # use JavaScript to read only the 8 top-level <td> children directly
+      row_handle = target_row.first.element_handle()
+      cells_data = page.evaluate(
+          """(row) => {
+            const tds = row.querySelectorAll(':scope > td');
+            return Array.from(tds).map((td, index) => {
+              // For most columns, grab only the first visible text node
+              // Skip any nested modal/popup content
+              const cloned = td.cloneNode(true);
+              // Remove hidden modal dialogs embedded in cells
+              cloned.querySelectorAll('.modal, [style*="display: none"], .collapse, .modal-dialog').forEach(el => el.remove());
+              return cloned.textContent.trim().replace(/\\s+/g, ' ');
+            });
+          }""",
+          row_handle,
+      )
+
       browser.close()
 
-      cleaned_cells = [c.strip().replace("\n", " ") for c in cells if c.strip()]
-      return cleaned_cells, None
+      if not cells_data:
+        return None, "Row found but could not extract cell data."
+
+      # Build a dict mapping column names to values
+      result = {}
+      for i, col in enumerate(COLUMNS):
+        result[col] = cells_data[i] if i < len(cells_data) else "N/A"
+
+      return result, None
 
     except Exception as e:
+      try:
+        page.screenshot(path="debug_error.png")
+      except Exception:
+        pass
       browser.close()
       return None, str(e)
 
 
-def send_email(cells_data, error=None):
+def send_email(data, error=None):
+  """Send an HTML email with extraction results or error details."""
   sender_email = os.environ.get("SENDER_EMAIL")
   sender_password = os.environ.get("SENDER_APP_PASSWORD")
   recipient_raw = os.environ.get("RECIPIENT_EMAIL", "")
 
   recipients = [e.strip() for e in recipient_raw.split(",") if e.strip()]
   if not recipients:
-    print("No recipients configured.")
+    print("⚠️  No recipients configured in RECIPIENT_EMAIL.")
     return
 
   msg = MIMEMultipart("alternative")
   msg["From"] = sender_email
   msg["To"] = ", ".join(recipients)
 
-  current_time = datetime.now().strftime("%d %b %Y, %I:%M %p")
+  current_time = datetime.now().strftime("%d %b %Y, %I:%M %p UTC")
 
   if error:
-    msg["Subject"] = "⚠️ [SIH Alert] Tracking Issue for CCTV PS"
+    msg["Subject"] = f"⚠️ [SIH Alert] Tracking Issue for {PS_ID}"
     html = f"""
-        <html>
-        <body style="font-family: Arial, sans-serif; color: #333;">
-            <h3>SIH Tracker Notification</h3>
-            <p><strong>Status:</strong> Could not retrieve count at {current_time} UTC.</p>
-            <p style="color: #c0392b;"><strong>Details:</strong> {error}</p>
-        </body>
-        </html>
-        """
+    <html>
+    <body style="font-family: Arial, sans-serif; color: #333;">
+      <h3>SIH Tracker — Error Report</h3>
+      <p><strong>Checked At:</strong> {current_time}</p>
+      <p style="color: #c0392b;"><strong>Error:</strong> {error}</p>
+      <p style="font-size: 12px; color: #888;">This is an automated alert from your SIH Tracker workflow.</p>
+    </body>
+    </html>
+    """
   else:
-    msg["Subject"] = "📊 [SIH Update] Current Submissions for Border CCTV PS"
-    cells_markup = "".join(
-        [
-            (
-                f"<td style='padding: 8px 12px; border: 1px solid #ddd;"
-                f" font-size: 14px;'>{cell}</td>"
-            )
-            for cell in cells_data
-        ]
+    submitted = data.get("Submitted Idea(s) Count", "N/A")
+    msg["Subject"] = f"📊 [SIH Update] {PS_ID} — {submitted} Submissions"
+
+    rows_html = "".join(
+        f"""<tr>
+          <td style="padding: 10px 14px; border: 1px solid #e0e0e0; font-weight: 600; background: #f8f9fa; white-space: nowrap;">{col}</td>
+          <td style="padding: 10px 14px; border: 1px solid #e0e0e0;">{val}</td>
+        </tr>"""
+        for col, val in data.items()
     )
 
     html = f"""
-        <html>
-        <body style="font-family: Arial, sans-serif; color: #222;">
-            <h3 style="color: #1a73e8;">SIH Problem Statement Update</h3>
-            <p><strong>Searched:</strong> {SEARCH_QUERY}</p>
-            <p><strong>Checked At:</strong> {current_time} UTC</p>
-            
-            <table style="border-collapse: collapse; width: 100%; margin-top: 15px;">
-                <thead>
-                    <tr style="background-color: #f1f3f4; text-align: left;">
-                        <th colspan="{len(cells_data)}" style="padding: 10px; border: 1px solid #ddd;">Matched Row Data</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>{cells_markup}</tr>
-                </tbody>
-            </table>
-        </body>
-        </html>
-        """
+    <html>
+    <body style="font-family: Arial, sans-serif; color: #222; line-height: 1.6;">
+      <h2 style="color: #1a73e8; margin-bottom: 5px;">SIH Problem Statement Tracker</h2>
+      <p style="margin-top: 0;"><strong>Checked At:</strong> {current_time}</p>
+
+      <table style="border-collapse: collapse; width: 100%; max-width: 650px; margin-top: 10px;">
+        {rows_html}
+      </table>
+
+      <p style="font-size: 12px; color: #888; margin-top: 20px;">
+        Automated notification from
+        <a href="https://github.com/GNANA-TIRUPATI/notifier">GNANA-TIRUPATI/notifier</a>.
+      </p>
+    </body>
+    </html>
+    """
 
   msg.attach(MIMEText(html, "html"))
 
@@ -130,9 +169,19 @@ def send_email(cells_data, error=None):
     server.starttls()
     server.login(sender_email, sender_password)
     server.sendmail(sender_email, recipients, msg.as_string())
+  print(f"✅ Email sent to: {', '.join(recipients)}")
 
 
 if __name__ == "__main__":
+  print(f"🔍 Fetching data for {PS_ID} from {PORTAL_URL}...")
   data, err = fetch_submission_count()
+
+  if err:
+    print(f"❌ Error: {err}")
+  else:
+    print(f"✅ Data extracted successfully:")
+    for col, val in data.items():
+      print(f"   {col}: {val}")
+
   send_email(data, err)
-  print("Tracking run finished.")
+  print("🏁 Tracking run finished.")
