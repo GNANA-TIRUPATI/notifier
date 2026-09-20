@@ -3,7 +3,7 @@ import smtplib
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright  # pyrefly: ignore
 
 PS_ID = "SIH26187"
 PORTAL_URL = "https://sih.gov.in/sih2026PS"
