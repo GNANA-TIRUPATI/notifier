@@ -1,14 +1,21 @@
 import os
 import smtplib
+import subprocess
+import sys
+import urllib.request
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from playwright.sync_api import sync_playwright  # pyrefly: ignore
+from bs4 import BeautifulSoup
+
+# Ensure UTF-8 output on all platforms
+if hasattr(sys.stdout, "reconfigure"):
+  sys.stdout.reconfigure(encoding="utf-8")
 
 PS_ID = "SIH26187"
 PORTAL_URL = "https://sih.gov.in/sih2026PS"
 
-# Column headers matching the visible DataTable columns (0-indexed)
+# Visible DataTable columns
 COLUMNS = [
     "S.No.",
     "Organization",
@@ -21,91 +28,131 @@ COLUMNS = [
 ]
 
 
+def parse_sih_html(html_text, target_ps_id=PS_ID):
+  """Parse portal HTML and extract problem statement details."""
+  soup = BeautifulSoup(html_text, "html.parser")
+  table = soup.find("table", id="dataTablePS")
+  if not table:
+    return None, "Table #dataTablePS not found in portal HTML"
+
+  tbody = table.find("tbody")
+  if not tbody:
+    return None, "tbody not found in #dataTablePS"
+
+  for tr in tbody.find_all("tr"):
+    tds = tr.find_all("td", recursive=False)
+    if len(tds) < 8:
+      continue
+    ps_number = tds[4].get_text(strip=True)
+    if ps_number == target_ps_id:
+      title_cell = tds[2]
+      link = title_cell.find("a")
+      title = (
+          link.get_text(strip=True) if link else title_cell.get_text(strip=True)
+      )
+      return {
+          "S.No.": tds[0].get_text(strip=True),
+          "Organization": tds[1].get_text(strip=True),
+          "Problem Statement Title": title,
+          "Category": tds[3].get_text(strip=True),
+          "PS Number": ps_number,
+          "Submitted Idea(s) Count": tds[5].get_text(strip=True),
+          "Theme": tds[6].get_text(strip=True),
+          "Deadline for Idea Submission": tds[7].get_text(strip=True),
+      }, None
+
+  return None, f"PS ID '{target_ps_id}' not found in table rows"
+
+
 def fetch_submission_count():
-  """Scrape the SIH portal DataTable for the target problem statement row."""
-  with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True)
-    context = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            " (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
-    )
-    page = context.new_page()
+  """Fetch problem statement data using multi-strategy HTTP/browser fallback."""
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
+          " like Gecko) Chrome/126.0.0.0 Safari/537.36"
+      ),
+      "Accept": (
+          "text/html,application/xhtml+xml,application/xml;q=0.9,"
+          "image/avif,image/webp,*/*;q=0.8"
+      ),
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://sih.gov.in/",
+  }
 
-    try:
+  # Strategy 1: curl with browser headers (optimal on Linux CI runners against WAF)
+  try:
+    cmd = [
+        "curl",
+        "-sS",
+        "-L",
+        "--max-time",
+        "60",
+        "--compressed",
+        "-H",
+        f"User-Agent: {headers['User-Agent']}",
+        "-H",
+        f"Accept: {headers['Accept']}",
+        "-H",
+        f"Accept-Language: {headers['Accept-Language']}",
+        "-H",
+        f"Referer: {headers['Referer']}",
+        PORTAL_URL,
+    ]
+    res = subprocess.run(cmd, capture_output=True, timeout=75)
+    if res.returncode == 0 and len(res.stdout) > 50000:
+      html = res.stdout.decode("utf-8", errors="replace")
+      if "dataTablePS" in html:
+        data, err = parse_sih_html(html)
+        if data:
+          print("  [✓] Successfully extracted via curl")
+          return data, None
+  except Exception as e:
+    print(f"  [i] curl attempt skipped: {e}")
+
+  # Strategy 2: Python standard urllib
+  try:
+    req = urllib.request.Request(PORTAL_URL, headers=headers)
+    with urllib.request.urlopen(req, timeout=45) as resp:
+      html = resp.read().decode("utf-8", errors="replace")
+      if "dataTablePS" in html:
+        data, err = parse_sih_html(html)
+        if data:
+          print("  [✓] Successfully extracted via urllib")
+          return data, None
+  except Exception as e:
+    print(f"  [i] urllib attempt skipped: {e}")
+
+  # Strategy 3: Playwright headless browser fallback
+  try:
+    from playwright.sync_api import sync_playwright  # pyrefly: ignore
+
+    with sync_playwright() as p:
+      browser = p.chromium.launch(
+          headless=True,
+          args=[
+              "--disable-blink-features=AutomationControlled",
+              "--no-sandbox",
+              "--disable-setuid-sandbox",
+          ],
+      )
+      context = browser.new_context(
+          user_agent=headers["User-Agent"],
+          viewport={"width": 1920, "height": 1080},
+          extra_http_headers=headers,
+      )
+      page = context.new_page()
       page.goto(PORTAL_URL, timeout=60000, wait_until="domcontentloaded")
-
-      # Wait for the DataTable to render rows
-      page.wait_for_selector(
-          "#dataTablePS tbody tr td", timeout=45000, state="attached"
-      )
-
-      # Filter using the search box if present
-      search_input = page.locator('input[type="search"]').first
-      try:
-        search_input.wait_for(state="attached", timeout=10000)
-        search_input.fill(PS_ID)
-        page.wait_for_timeout(1500)
-      except Exception:
-        pass
-
-      # Locate the filtered row in the main DataTable
-      target_row = page.locator(f"#dataTablePS tbody tr:has-text('{PS_ID}')")
-      try:
-        target_row.first.wait_for(state="attached", timeout=15000)
-      except Exception:
-        pass
-      if target_row.count() == 0:
-        # Capture diagnostic info on failure
-        page_title = page.title()
-        page.screenshot(path="debug_failure.png")
-        all_text = page.locator("#dataTablePS").inner_text()[:500]
-        browser.close()
-        return None, (
-            f"PS ID '{PS_ID}' not found after search. "
-            f"Page title: '{page_title}'. "
-            f"Table preview: {all_text}"
-        )
-
-      # Extract only the direct visible <td> cells from the first matching row
-      # The SIH table embeds hidden modal content inside <td> elements, so we
-      # use JavaScript to read only the 8 top-level <td> children directly
-      row_handle = target_row.first.element_handle()
-      cells_data = page.evaluate(
-          """(row) => {
-            const tds = row.querySelectorAll(':scope > td');
-            return Array.from(tds).map((td, index) => {
-              // For most columns, grab only the first visible text node
-              // Skip any nested modal/popup content
-              const cloned = td.cloneNode(true);
-              // Remove hidden modal dialogs embedded in cells
-              cloned.querySelectorAll('.modal, [style*="display: none"], .collapse, .modal-dialog').forEach(el => el.remove());
-              return cloned.textContent.trim().replace(/\\s+/g, ' ');
-            });
-          }""",
-          row_handle,
-      )
-
+      html = page.content()
       browser.close()
+      if "dataTablePS" in html:
+        data, err = parse_sih_html(html)
+        if data:
+          print("  [✓] Successfully extracted via Playwright")
+          return data, None
+  except Exception as e:
+    print(f"  [i] playwright fallback skipped: {e}")
 
-      if not cells_data:
-        return None, "Row found but could not extract cell data."
-
-      # Build a dict mapping column names to values
-      result = {}
-      for i, col in enumerate(COLUMNS):
-        result[col] = cells_data[i] if i < len(cells_data) else "N/A"
-
-      return result, None
-
-    except Exception as e:
-      try:
-        page.screenshot(path="debug_error.png")
-      except Exception:
-        pass
-      browser.close()
-      return None, str(e)
+  return None, f"All fetch strategies failed to retrieve table data for {PS_ID}."
 
 
 def send_email(data, error=None):
@@ -183,7 +230,7 @@ if __name__ == "__main__":
   if err:
     print(f"❌ Error: {err}")
   else:
-    print(f"✅ Data extracted successfully:")
+    print("✅ Data extracted successfully:")
     for col, val in data.items():
       print(f"   {col}: {val}")
 
