@@ -3,7 +3,7 @@ import smtplib
 import subprocess
 import sys
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from bs4 import BeautifulSoup
@@ -14,6 +14,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 PS_ID = "SIH26187"
 PORTAL_URL = "https://sih.gov.in/sih2026PS"
+
+# India Standard Time (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # Visible DataTable columns
 COLUMNS = [
@@ -27,6 +30,22 @@ COLUMNS = [
     "Deadline for Idea Submission",
 ]
 
+# Shared browser-like headers
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
+        " like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://sih.gov.in/",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
 
 def parse_sih_html(html_text, target_ps_id=PS_ID):
   """Parse portal HTML and extract problem statement details."""
@@ -39,7 +58,10 @@ def parse_sih_html(html_text, target_ps_id=PS_ID):
   if not tbody:
     return None, "tbody not found in #dataTablePS"
 
-  for tr in tbody.find_all("tr"):
+  rows = tbody.find_all("tr")
+  print(f"    Found {len(rows)} rows in #dataTablePS")
+
+  for tr in rows:
     tds = tr.find_all("td", recursive=False)
     if len(tds) < 8:
       continue
@@ -64,65 +86,121 @@ def parse_sih_html(html_text, target_ps_id=PS_ID):
   return None, f"PS ID '{target_ps_id}' not found in table rows"
 
 
-def fetch_submission_count():
-  """Fetch problem statement data using multi-strategy HTTP/browser fallback."""
-  headers = {
-      "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-          " like Gecko) Chrome/126.0.0.0 Safari/537.36"
-      ),
-      "Accept": (
-          "text/html,application/xhtml+xml,application/xml;q=0.9,"
-          "image/avif,image/webp,*/*;q=0.8"
-      ),
-      "Accept-Language": "en-US,en;q=0.9",
-      "Referer": "https://sih.gov.in/",
-  }
+def fetch_with_requests():
+  """Strategy 1: Use the requests library with session and retry logic."""
+  try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+  except ImportError:
+    return None, "requests library not installed"
 
-  # Strategy 1: curl with browser headers (optimal on Linux CI runners against WAF)
+  print("  [→] Trying requests library...")
+  try:
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    session.headers.update(HEADERS)
+
+    resp = session.get(PORTAL_URL, timeout=90, allow_redirects=True)
+    resp.raise_for_status()
+    html = resp.text
+    print(f"    Response: {resp.status_code}, size: {len(html)} bytes")
+
+    if "dataTablePS" in html:
+      data, err = parse_sih_html(html)
+      if data:
+        print("  [✓] Successfully extracted via requests")
+        return data, None
+      else:
+        print(f"    [!] Table found but parse failed: {err}")
+        return None, err
+    else:
+      print("    [!] dataTablePS not found in response HTML")
+      return None, "dataTablePS not in response"
+  except Exception as e:
+    print(f"  [✗] requests failed: {e}")
+    return None, str(e)
+
+
+def fetch_with_curl():
+  """Strategy 2: curl with browser headers and retries."""
+  print("  [→] Trying curl...")
   try:
     cmd = [
         "curl",
         "-sS",
         "-L",
-        "--max-time",
-        "60",
+        "--max-time", "90",
+        "--retry", "3",
+        "--retry-delay", "5",
         "--compressed",
-        "-H",
-        f"User-Agent: {headers['User-Agent']}",
-        "-H",
-        f"Accept: {headers['Accept']}",
-        "-H",
-        f"Accept-Language: {headers['Accept-Language']}",
-        "-H",
-        f"Referer: {headers['Referer']}",
+        "-H", f"User-Agent: {HEADERS['User-Agent']}",
+        "-H", f"Accept: {HEADERS['Accept']}",
+        "-H", f"Accept-Language: {HEADERS['Accept-Language']}",
+        "-H", f"Referer: {HEADERS['Referer']}",
+        "-H", "Connection: keep-alive",
+        "-H", "Upgrade-Insecure-Requests: 1",
         PORTAL_URL,
     ]
-    res = subprocess.run(cmd, capture_output=True, timeout=75)
-    if res.returncode == 0 and len(res.stdout) > 50000:
+    res = subprocess.run(cmd, capture_output=True, timeout=120)
+    if res.returncode == 0 and res.stdout:
       html = res.stdout.decode("utf-8", errors="replace")
+      print(f"    Response size: {len(html)} bytes")
       if "dataTablePS" in html:
         data, err = parse_sih_html(html)
         if data:
           print("  [✓] Successfully extracted via curl")
           return data, None
+        else:
+          print(f"    [!] Table found but parse failed: {err}")
+          return None, err
+      else:
+        print("    [!] dataTablePS not found in curl response")
+        return None, "dataTablePS not in curl response"
+    else:
+      stderr_msg = res.stderr.decode("utf-8", errors="replace")[:200] if res.stderr else "no stderr"
+      print(f"    [!] curl returned code {res.returncode}: {stderr_msg}")
+      return None, f"curl exit code {res.returncode}"
+  except FileNotFoundError:
+    print("  [✗] curl not found on this system")
+    return None, "curl not available"
   except Exception as e:
-    print(f"  [i] curl attempt skipped: {e}")
+    print(f"  [✗] curl failed: {e}")
+    return None, str(e)
 
-  # Strategy 2: Python standard urllib
+
+def fetch_with_urllib():
+  """Strategy 3: Python standard urllib."""
+  print("  [→] Trying urllib...")
   try:
-    req = urllib.request.Request(PORTAL_URL, headers=headers)
-    with urllib.request.urlopen(req, timeout=45) as resp:
+    req = urllib.request.Request(PORTAL_URL, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=90) as resp:
       html = resp.read().decode("utf-8", errors="replace")
+      print(f"    Response size: {len(html)} bytes")
       if "dataTablePS" in html:
         data, err = parse_sih_html(html)
         if data:
           print("  [✓] Successfully extracted via urllib")
           return data, None
+        else:
+          print(f"    [!] Table found but parse failed: {err}")
+          return None, err
+      else:
+        print("    [!] dataTablePS not found in urllib response")
+        return None, "dataTablePS not in urllib response"
   except Exception as e:
-    print(f"  [i] urllib attempt skipped: {e}")
+    print(f"  [✗] urllib failed: {e}")
+    return None, str(e)
 
-  # Strategy 3: Playwright headless browser fallback
+
+def fetch_with_playwright():
+  """Strategy 4: Playwright headless browser with stealth and explicit waits."""
+  print("  [→] Trying Playwright headless browser...")
   try:
     from playwright.sync_api import sync_playwright  # pyrefly: ignore
 
@@ -133,26 +211,70 @@ def fetch_submission_count():
               "--disable-blink-features=AutomationControlled",
               "--no-sandbox",
               "--disable-setuid-sandbox",
+              "--disable-dev-shm-usage",
           ],
       )
       context = browser.new_context(
-          user_agent=headers["User-Agent"],
+          user_agent=HEADERS["User-Agent"],
           viewport={"width": 1920, "height": 1080},
-          extra_http_headers=headers,
+          extra_http_headers={
+              "Accept-Language": HEADERS["Accept-Language"],
+              "Upgrade-Insecure-Requests": "1",
+          },
       )
       page = context.new_page()
-      page.goto(PORTAL_URL, timeout=60000, wait_until="domcontentloaded")
+
+      # Inject stealth script to evade bot detection
+      page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        window.chrome = { runtime: {} };
+      """)
+
+      page.goto(PORTAL_URL, timeout=90000, wait_until="networkidle")
+      # Wait explicitly for the data table to appear
+      page.wait_for_selector("#dataTablePS", timeout=30000)
+
       html = page.content()
+      print(f"    Page content size: {len(html)} bytes")
       browser.close()
+
       if "dataTablePS" in html:
         data, err = parse_sih_html(html)
         if data:
           print("  [✓] Successfully extracted via Playwright")
           return data, None
+        else:
+          print(f"    [!] Table found but parse failed: {err}")
+          return None, err
+      else:
+        print("    [!] dataTablePS not found in Playwright page")
+        return None, "dataTablePS not in Playwright page"
   except Exception as e:
-    print(f"  [i] playwright fallback skipped: {e}")
+    print(f"  [✗] Playwright failed: {e}")
+    return None, str(e)
 
-  return None, f"All fetch strategies failed to retrieve table data for {PS_ID}."
+
+def fetch_submission_count():
+  """Fetch problem statement data using multi-strategy HTTP/browser fallback."""
+  strategies = [
+      ("requests", fetch_with_requests),
+      ("curl", fetch_with_curl),
+      ("urllib", fetch_with_urllib),
+      ("playwright", fetch_with_playwright),
+  ]
+
+  errors = []
+  for name, strategy_fn in strategies:
+    data, err = strategy_fn()
+    if data:
+      return data, None
+    if err:
+      errors.append(f"{name}: {err}")
+
+  error_summary = "; ".join(errors)
+  return None, f"All fetch strategies failed for {PS_ID}. Details: {error_summary}"
 
 
 def send_email(data, error=None):
@@ -170,11 +292,12 @@ def send_email(data, error=None):
   msg["From"] = sender_email
   msg["To"] = ", ".join(recipients)
 
-  current_time = datetime.now().strftime("%d %b %Y, %I:%M %p UTC")
+  # Use IST (India Standard Time) for the timestamp
+  current_time = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
 
   if error:
     msg["Subject"] = f"⚠️ [SIH Alert] Tracking Issue for {PS_ID}"
-    html = f"""
+    html = f"""\
     <html>
     <body style="font-family: Arial, sans-serif; color: #333;">
       <h3>SIH Tracker — Error Report</h3>
@@ -196,7 +319,7 @@ def send_email(data, error=None):
         for col, val in data.items()
     )
 
-    html = f"""
+    html = f"""\
     <html>
     <body style="font-family: Arial, sans-serif; color: #222; line-height: 1.6;">
       <h2 style="color: #1a73e8; margin-bottom: 5px;">SIH Problem Statement Tracker</h2>
@@ -225,6 +348,7 @@ def send_email(data, error=None):
 
 if __name__ == "__main__":
   print(f"🔍 Fetching data for {PS_ID} from {PORTAL_URL}...")
+  print(f"   Current time (IST): {datetime.now(IST).strftime('%d %b %Y, %I:%M %p IST')}")
   data, err = fetch_submission_count()
 
   if err:
