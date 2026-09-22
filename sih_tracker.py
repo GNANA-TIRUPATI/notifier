@@ -12,6 +12,23 @@ from bs4 import BeautifulSoup
 if hasattr(sys.stdout, "reconfigure"):
   sys.stdout.reconfigure(encoding="utf-8")
 
+
+def load_env_file():
+  """Load environment variables from a local .env file if present."""
+  env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+  if os.path.exists(env_file):
+    with open(env_file, "r", encoding="utf-8") as f:
+      for line in f:
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+          k, v = line.split("=", 1)
+          k, v = k.strip(), v.strip().strip("'\"")
+          if k and k not in os.environ:
+            os.environ[k] = v
+
+
+load_env_file()
+
 PS_ID = "SIH26187"
 PORTAL_URL = "https://sih.gov.in/sih2026PS"
 HOME_URL = "https://sih.gov.in/"
@@ -87,8 +104,11 @@ def parse_sih_html(html_text, target_ps_id=PS_ID):
   return None, f"PS ID '{target_ps_id}' not found in table rows"
 
 
+PROXY_SERVER = os.environ.get("PROXY_URL") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+
+
 def fetch_with_playwright():
-  """Strategy 1 (Primary): Playwright headless browser with WAF bypass.
+  """Strategy 1: Playwright headless browser with WAF bypass and proxy support.
 
   This is the primary strategy because the SIH portal uses Cloudflare/WAF
   that blocks datacenter IPs (like GitHub Actions). Playwright can handle
@@ -101,9 +121,9 @@ def fetch_with_playwright():
     import time
 
     with sync_playwright() as p:
-      browser = p.chromium.launch(
-          headless=True,
-          args=[
+      launch_kwargs = {
+          "headless": True,
+          "args": [
               "--disable-blink-features=AutomationControlled",
               "--no-sandbox",
               "--disable-setuid-sandbox",
@@ -111,7 +131,12 @@ def fetch_with_playwright():
               "--disable-gpu",
               "--window-size=1920,1080",
           ],
-      )
+      }
+      if PROXY_SERVER:
+        print(f"    Using proxy for Playwright: {PROXY_SERVER}")
+        launch_kwargs["proxy"] = {"server": PROXY_SERVER}
+
+      browser = p.chromium.launch(**launch_kwargs)
       context = browser.new_context(
           user_agent=HEADERS["User-Agent"],
           viewport={"width": 1920, "height": 1080},
@@ -250,7 +275,8 @@ def fetch_with_requests():
         backoff_factor=2,
         status_forcelist=[429, 500, 502, 503, 504],
     )
-    session.mount("https://", HTTPAdapter(max_retries=retries))
+    if PROXY_SERVER:
+      session.proxies = {"http": PROXY_SERVER, "https": PROXY_SERVER}
     session.headers.update(HEADERS)
 
     # Step 1: Visit homepage first to get cookies (WAF bypass)
@@ -390,16 +416,52 @@ def fetch_with_urllib():
     return None, str(e)
 
 
+def fetch_with_scraperapi():
+  """Strategy: Use ScraperAPI with India geo-targeting to bypass datacenter IP block."""
+  api_key = os.environ.get("SCRAPERAPI_KEY")
+  if not api_key:
+    return None, "SCRAPERAPI_KEY not set"
+
+  print("  [→] Trying ScraperAPI with India IP (country_code=in)...")
+  try:
+    import requests
+    resp = requests.get(
+        "http://api.scraperapi.com",
+        params={
+            "api_key": api_key,
+            "url": PORTAL_URL,
+            "country_code": "in",
+            "render": "true",
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    html = resp.text
+    print(f"    ScraperAPI response size: {len(html)} bytes")
+    if "dataTablePS" in html:
+      data, err = parse_sih_html(html)
+      if data:
+        print("  [✓] Successfully extracted via ScraperAPI")
+        return data, None
+      return None, err
+    return None, "dataTablePS not found in ScraperAPI response"
+  except Exception as e:
+    print(f"  [✗] ScraperAPI failed: {e}")
+    return None, str(e)
+
+
 def fetch_submission_count():
   """Fetch problem statement data using multi-strategy HTTP/browser fallback.
 
   Strategy order:
-  1. Playwright (best for WAF bypass - runs real browser)
-  2. requests (session with cookies)
-  3. curl (cookie jar)
-  4. urllib (cookie processor)
+  1. ScraperAPI (if SCRAPERAPI_KEY is configured — bypasses geo-blocking)
+  2. Playwright (best for WAF bypass - runs real browser)
+  3. requests (session with cookies)
+  4. curl (cookie jar)
+  5. urllib (cookie processor)
   """
   strategies = [
+      ("scraperapi", fetch_with_scraperapi),
       ("playwright", fetch_with_playwright),
       ("requests", fetch_with_requests),
       ("curl", fetch_with_curl),
