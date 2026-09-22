@@ -425,6 +425,24 @@ def fetch_with_scraperapi():
   print("  [→] Trying ScraperAPI with India IP (country_code=in)...")
   try:
     import requests
+    # First attempt: standard fast request (1 API credit)
+    resp = requests.get(
+        "http://api.scraperapi.com",
+        params={
+            "api_key": api_key,
+            "url": PORTAL_URL,
+            "country_code": "in",
+        },
+        timeout=60,
+    )
+    if resp.status_code == 200 and "dataTablePS" in resp.text:
+      data, err = parse_sih_html(resp.text)
+      if data:
+        print("  [✓] Successfully extracted via ScraperAPI (standard)")
+        return data, None
+
+    # Fallback attempt: JS rendering enabled (5 API credits)
+    print("    Standard ScraperAPI attempt didn't find table, trying with JS rendering...")
     resp = requests.get(
         "http://api.scraperapi.com",
         params={
@@ -441,7 +459,7 @@ def fetch_with_scraperapi():
     if "dataTablePS" in html:
       data, err = parse_sih_html(html)
       if data:
-        print("  [✓] Successfully extracted via ScraperAPI")
+        print("  [✓] Successfully extracted via ScraperAPI (rendered)")
         return data, None
       return None, err
     return None, "dataTablePS not found in ScraperAPI response"
