@@ -25,6 +25,7 @@ jobs:
           playwright install chromium --with-deps
 
       - name: Run SIH tracker
+        timeout-minutes: 10
         env:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_APP_PASSWORD: ${{ secrets.SENDER_APP_PASSWORD }}

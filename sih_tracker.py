@@ -14,6 +14,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 PS_ID = "SIH26187"
 PORTAL_URL = "https://sih.gov.in/sih2026PS"
+HOME_URL = "https://sih.gov.in/"
 
 # India Standard Time (UTC+5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -86,8 +87,154 @@ def parse_sih_html(html_text, target_ps_id=PS_ID):
   return None, f"PS ID '{target_ps_id}' not found in table rows"
 
 
+def fetch_with_playwright():
+  """Strategy 1 (Primary): Playwright headless browser with WAF bypass.
+
+  This is the primary strategy because the SIH portal uses Cloudflare/WAF
+  that blocks datacenter IPs (like GitHub Actions). Playwright can handle
+  WAF challenges by first visiting the homepage to get cookies, then
+  navigating to the PS page.
+  """
+  print("  [→] Trying Playwright headless browser...")
+  try:
+    from playwright.sync_api import sync_playwright  # pyrefly: ignore
+    import time
+
+    with sync_playwright() as p:
+      browser = p.chromium.launch(
+          headless=True,
+          args=[
+              "--disable-blink-features=AutomationControlled",
+              "--no-sandbox",
+              "--disable-setuid-sandbox",
+              "--disable-dev-shm-usage",
+              "--disable-gpu",
+              "--window-size=1920,1080",
+          ],
+      )
+      context = browser.new_context(
+          user_agent=HEADERS["User-Agent"],
+          viewport={"width": 1920, "height": 1080},
+          extra_http_headers={
+              "Accept-Language": HEADERS["Accept-Language"],
+              "Upgrade-Insecure-Requests": "1",
+          },
+          java_script_enabled=True,
+      )
+      page = context.new_page()
+
+      # Inject stealth script to evade bot detection
+      page.add_init_script("""
+        // Override webdriver detection
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        // Override plugins
+        Object.defineProperty(navigator, 'plugins', {
+          get: () => [1, 2, 3, 4, 5]
+        });
+        // Override languages
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['en-US', 'en']
+        });
+        // Override Chrome runtime
+        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+        // Override permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) =>
+          parameters.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : originalQuery(parameters);
+      """)
+
+      # Step 1: Visit homepage first to get cookies and pass WAF challenge
+      print("    Step 1: Visiting homepage to obtain cookies...")
+      page.goto(HOME_URL, timeout=60000, wait_until="networkidle")
+      # Wait for potential WAF challenge to resolve
+      time.sleep(5)
+      print(f"    Homepage loaded, URL: {page.url}")
+
+      # Step 2: Navigate to the PS page (now with valid cookies)
+      print("    Step 2: Navigating to problem statements page...")
+      page.goto(PORTAL_URL, timeout=90000, wait_until="networkidle")
+
+      # Step 3: Wait for the data table to appear with extended timeout
+      print("    Step 3: Waiting for #dataTablePS table...")
+      try:
+        page.wait_for_selector("#dataTablePS", timeout=60000)
+        print("    Table selector found!")
+      except Exception:
+        print("    Table selector timeout, checking for tbody rows...")
+        try:
+          page.wait_for_selector("#dataTablePS tbody tr", timeout=30000)
+          print("    Table rows found!")
+        except Exception:
+          print("    No table rows found either, trying page content anyway...")
+
+      # Step 4: Use the DataTable search box to filter for our PS ID
+      # This is critical because the DataTable paginates (max 100 per page)
+      # and PS IDs beyond the first page won't be in the DOM
+      print(f"    Step 4: Searching for {PS_ID} in DataTable search box...")
+      try:
+        search_input = page.query_selector(
+            'input[type="search"], input[aria-controls="dataTablePS"], '
+            '#dataTablePS_filter input'
+        )
+        if search_input:
+          search_input.fill(PS_ID)
+          # Trigger DataTable search via events
+          page.evaluate("""
+            const input = document.querySelector('input[type="search"], input[aria-controls="dataTablePS"]');
+            if (input) {
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              input.dispatchEvent(new Event('keyup', { bubbles: true }));
+            }
+            // Also try jQuery DataTables API if available
+            if (window.jQuery && window.jQuery.fn.dataTable) {
+              try { window.jQuery('#dataTablePS').DataTable().search('%s').draw(); } catch(e) {}
+            }
+          """ % PS_ID)
+          # Wait for table to re-render with filtered results
+          time.sleep(3)
+          print(f"    Search filter applied for '{PS_ID}'")
+        else:
+          print("    [!] Search input not found, using raw page content")
+      except Exception as e:
+        print(f"    [!] Search filter failed: {e}, using raw page content")
+
+      html = page.content()
+      page_url = page.url
+      print(f"    Final URL: {page_url}")
+      print(f"    Page content size: {len(html)} bytes")
+      browser.close()
+
+      if "dataTablePS" in html:
+        data, err = parse_sih_html(html)
+        if data:
+          print("  [✓] Successfully extracted via Playwright")
+          return data, None
+        else:
+          print(f"    [!] Table found but parse failed: {err}")
+          return None, err
+      else:
+        # Check what we got instead
+        soup = BeautifulSoup(html, "html.parser")
+        title = soup.find("title")
+        title_text = title.get_text(strip=True) if title else "No title"
+        print(f"    [!] dataTablePS not found. Page title: '{title_text}'")
+        # Check if it's a Cloudflare challenge page
+        if "challenge" in html.lower() or "cloudflare" in html.lower() or "cf-" in html.lower():
+          print("    [!] Detected Cloudflare/WAF challenge page")
+          return None, "WAF challenge page detected, could not bypass"
+        return None, f"dataTablePS not in Playwright page (title: {title_text})"
+  except ImportError:
+    print("  [✗] Playwright not installed")
+    return None, "playwright not installed"
+  except Exception as e:
+    print(f"  [✗] Playwright failed: {e}")
+    return None, str(e)
+
+
 def fetch_with_requests():
-  """Strategy 1: Use the requests library with session and retry logic."""
+  """Strategy 2: Use the requests library with session, cookies, and retry logic."""
   try:
     import requests
     from requests.adapters import HTTPAdapter
@@ -106,6 +253,12 @@ def fetch_with_requests():
     session.mount("https://", HTTPAdapter(max_retries=retries))
     session.headers.update(HEADERS)
 
+    # Step 1: Visit homepage first to get cookies (WAF bypass)
+    print("    Visiting homepage first for cookies...")
+    home_resp = session.get(HOME_URL, timeout=60, allow_redirects=True)
+    print(f"    Homepage: {home_resp.status_code}, cookies: {len(session.cookies)}")
+
+    # Step 2: Now fetch the PS page with cookies
     resp = session.get(PORTAL_URL, timeout=90, allow_redirects=True)
     resp.raise_for_status()
     html = resp.text
@@ -128,17 +281,38 @@ def fetch_with_requests():
 
 
 def fetch_with_curl():
-  """Strategy 2: curl with browser headers and retries."""
+  """Strategy 3: curl with browser headers, cookie jar, and retries."""
   print("  [→] Trying curl...")
   try:
+    import tempfile
+    cookie_jar = os.path.join(tempfile.gettempdir(), "sih_cookies.txt")
+
+    # Step 1: Visit homepage to get cookies
+    print("    Visiting homepage first for cookies...")
+    home_cmd = [
+        "curl", "-sS", "-L",
+        "--max-time", "60",
+        "--compressed",
+        "-c", cookie_jar,
+        "-H", f"User-Agent: {HEADERS['User-Agent']}",
+        "-H", f"Accept: {HEADERS['Accept']}",
+        "-H", f"Referer: {HEADERS['Referer']}",
+        "-H", "Connection: keep-alive",
+        "-H", "Upgrade-Insecure-Requests: 1",
+        "-o", "/dev/null",
+        HOME_URL,
+    ]
+    subprocess.run(home_cmd, capture_output=True, timeout=75)
+
+    # Step 2: Fetch the PS page with cookies
     cmd = [
-        "curl",
-        "-sS",
-        "-L",
+        "curl", "-sS", "-L",
         "--max-time", "90",
         "--retry", "3",
         "--retry-delay", "5",
         "--compressed",
+        "-b", cookie_jar,
+        "-c", cookie_jar,
         "-H", f"User-Agent: {HEADERS['User-Agent']}",
         "-H", f"Accept: {HEADERS['Accept']}",
         "-H", f"Accept-Language: {HEADERS['Accept-Language']}",
@@ -148,6 +322,13 @@ def fetch_with_curl():
         PORTAL_URL,
     ]
     res = subprocess.run(cmd, capture_output=True, timeout=120)
+
+    # Clean up cookie jar
+    try:
+      os.remove(cookie_jar)
+    except OSError:
+      pass
+
     if res.returncode == 0 and res.stdout:
       html = res.stdout.decode("utf-8", errors="replace")
       print(f"    Response size: {len(html)} bytes")
@@ -175,11 +356,22 @@ def fetch_with_curl():
 
 
 def fetch_with_urllib():
-  """Strategy 3: Python standard urllib."""
+  """Strategy 4: Python standard urllib with cookie handling."""
   print("  [→] Trying urllib...")
   try:
+    import http.cookiejar
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+    # Step 1: Visit homepage to get cookies
+    print("    Visiting homepage first for cookies...")
+    home_req = urllib.request.Request(HOME_URL, headers=HEADERS)
+    opener.open(home_req, timeout=60)
+    print(f"    Homepage cookies: {len(cj)}")
+
+    # Step 2: Fetch the PS page with cookies
     req = urllib.request.Request(PORTAL_URL, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=90) as resp:
+    with opener.open(req, timeout=90) as resp:
       html = resp.read().decode("utf-8", errors="replace")
       print(f"    Response size: {len(html)} bytes")
       if "dataTablePS" in html:
@@ -198,71 +390,20 @@ def fetch_with_urllib():
     return None, str(e)
 
 
-def fetch_with_playwright():
-  """Strategy 4: Playwright headless browser with stealth and explicit waits."""
-  print("  [→] Trying Playwright headless browser...")
-  try:
-    from playwright.sync_api import sync_playwright  # pyrefly: ignore
-
-    with sync_playwright() as p:
-      browser = p.chromium.launch(
-          headless=True,
-          args=[
-              "--disable-blink-features=AutomationControlled",
-              "--no-sandbox",
-              "--disable-setuid-sandbox",
-              "--disable-dev-shm-usage",
-          ],
-      )
-      context = browser.new_context(
-          user_agent=HEADERS["User-Agent"],
-          viewport={"width": 1920, "height": 1080},
-          extra_http_headers={
-              "Accept-Language": HEADERS["Accept-Language"],
-              "Upgrade-Insecure-Requests": "1",
-          },
-      )
-      page = context.new_page()
-
-      # Inject stealth script to evade bot detection
-      page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        window.chrome = { runtime: {} };
-      """)
-
-      page.goto(PORTAL_URL, timeout=90000, wait_until="networkidle")
-      # Wait explicitly for the data table to appear
-      page.wait_for_selector("#dataTablePS", timeout=30000)
-
-      html = page.content()
-      print(f"    Page content size: {len(html)} bytes")
-      browser.close()
-
-      if "dataTablePS" in html:
-        data, err = parse_sih_html(html)
-        if data:
-          print("  [✓] Successfully extracted via Playwright")
-          return data, None
-        else:
-          print(f"    [!] Table found but parse failed: {err}")
-          return None, err
-      else:
-        print("    [!] dataTablePS not found in Playwright page")
-        return None, "dataTablePS not in Playwright page"
-  except Exception as e:
-    print(f"  [✗] Playwright failed: {e}")
-    return None, str(e)
-
-
 def fetch_submission_count():
-  """Fetch problem statement data using multi-strategy HTTP/browser fallback."""
+  """Fetch problem statement data using multi-strategy HTTP/browser fallback.
+
+  Strategy order:
+  1. Playwright (best for WAF bypass - runs real browser)
+  2. requests (session with cookies)
+  3. curl (cookie jar)
+  4. urllib (cookie processor)
+  """
   strategies = [
+      ("playwright", fetch_with_playwright),
       ("requests", fetch_with_requests),
       ("curl", fetch_with_curl),
       ("urllib", fetch_with_urllib),
-      ("playwright", fetch_with_playwright),
   ]
 
   errors = []
