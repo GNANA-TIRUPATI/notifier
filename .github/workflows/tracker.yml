@@ -2,8 +2,8 @@ name: SIH Problem Statement Tracker
 
 on:
   schedule:
-    # Run every 12 hours: at midnight and noon UTC
-    - cron: "0 0,12 * * *"
+    # Run every 8 hours (00:00, 08:00, 16:00 UTC)
+    - cron: "0 */8 * * *"
   workflow_dispatch:
 
 jobs:
